@@ -1,0 +1,525 @@
+﻿//Developed by Luke Gamage
+
+#pragma kernel GenerateOctreeInfo
+#pragma kernel GenerateOctree
+#pragma kernel MarkTransitionals
+
+#pragma kernel Display
+
+#include "Includes/CMS_Tables.compute"
+
+#define NUM_THREADS 4
+
+#define TRANSI_NEIGHBOR_MAX 128
+#define TRANSI_NEIGHBOR_DEPTH_MAX 8192 
+
+
+struct Point {
+	float3 pos;
+	float value;
+	float3 normal;
+};
+
+struct Node {
+	float3 center;
+	float size;
+};
+
+struct OctIn {
+	uint localIntersections;
+	uint globalIntersectionsZYX[3];
+	float largestDotAngle;
+};
+
+AppendStructuredBuffer<Node>Nodes;
+StructuredBuffer<float4>Points;
+RWStructuredBuffer<OctIn>OctreeInfo;
+StructuredBuffer<OctIn>OctreeInfoRead;
+
+RWTexture3D<float4>Octree;
+Texture3D<float4>OctreeRead;
+
+/*User Defined Settings*/
+float surfaceLevel;
+float angleThreshold = 1;
+
+uint maxDepth;
+uint startDepth;
+uint startNodesPerAxis = 2;
+
+//Location Settings
+float Size;
+float3 Center;
+float3 up;
+float3 right;
+float3 forward;
+
+
+/*Calculated Settings*/
+uint maxPointsPerAxis;
+uint maxCellsPerAxis;
+uint localMaxDepth;
+
+/*Group shared data*/
+groupshared OctIn octreeInfo[64];
+
+
+uint GetIndex(uint3 id) {
+	return id.z + id.y * maxPointsPerAxis + id.x * maxPointsPerAxis * maxPointsPerAxis;
+}
+
+uint GetIndex(uint3 id, uint valuesPerAxis) {
+	return id.z + id.y * valuesPerAxis + id.x * valuesPerAxis * valuesPerAxis;
+}
+
+float4 GetPoint(uint3 id) {
+	return Points[GetIndex(id)];
+}
+
+uint getConfig(uint f, int cube[8]) {
+	uint config = 0;
+	for (uint c = 0; c < 4; c++) {
+		if (cube[localCornerToCorner[f][c]] <= 0)
+			config |= 1 << c;
+	}
+	return config;
+}
+
+bool CheckSurface(float4 i1, float4 i2) {
+	int s1 = sign(i1.w - surfaceLevel);
+	int s2 = sign(i2.w - surfaceLevel);
+	return abs(s1 - s2) == 2;// && !((s1 = 0 && s2 == 1) || (s1 == 1 && s2 == 0));
+}
+
+uint GetChildLocation(uint3 id) {
+	uint index = 0;
+	index += (id.z & 1);
+	index += (id.y & 1) << 1;
+	index += (id.x & 1) << 2;
+	return index;
+}
+
+/*Gather a pair of 8 OctIn's from the global memory buffer*/
+void GetGlobalOctreeInfoPairs(uint offset, uint3 id, uint nodesPerAxis, inout OctIn pairs[8]) {
+	OctIn infos[8] = {
+		OctreeInfo[offset + GetIndex(id + corners[0], nodesPerAxis)],
+		OctreeInfo[offset + GetIndex(id + corners[1], nodesPerAxis)],
+		OctreeInfo[offset + GetIndex(id + corners[2], nodesPerAxis)],
+		OctreeInfo[offset + GetIndex(id + corners[3], nodesPerAxis)],
+		OctreeInfo[offset + GetIndex(id + corners[4], nodesPerAxis)],
+		OctreeInfo[offset + GetIndex(id + corners[5], nodesPerAxis)],
+		OctreeInfo[offset + GetIndex(id + corners[6], nodesPerAxis)],
+		OctreeInfo[offset + GetIndex(id + corners[7], nodesPerAxis)],
+	};
+
+	pairs = infos;
+}
+
+void GetGlobalOctreeInfo(uint offset, uint3 id, uint nodesPerAxis, inout OctIn info) {
+	info = OctreeInfo[offset + GetIndex(id, nodesPerAxis)];
+}
+
+/*Gather a pair of 8 OctIn's from the group shared local memory*/
+void GetLocalOctreeInfoPairs(uint offset, uint3 id, uint nodesPerAxis, inout OctIn pairs[8]) {
+	OctIn infos[8] = {
+		octreeInfo[offset + GetIndex(id + corners[0], nodesPerAxis)],
+		octreeInfo[offset + GetIndex(id + corners[1], nodesPerAxis)],
+		octreeInfo[offset + GetIndex(id + corners[2], nodesPerAxis)],
+		octreeInfo[offset + GetIndex(id + corners[3], nodesPerAxis)],
+		octreeInfo[offset + GetIndex(id + corners[4], nodesPerAxis)],
+		octreeInfo[offset + GetIndex(id + corners[5], nodesPerAxis)],
+		octreeInfo[offset + GetIndex(id + corners[6], nodesPerAxis)],
+		octreeInfo[offset + GetIndex(id + corners[7], nodesPerAxis)],
+	};
+
+	pairs = infos;
+}
+
+/*Gather the Points for a given node coordinate*/
+void GetLeafNode(uint3 id, inout float4 node[8]) {
+	float4 indexedNode[8] = {
+		GetPoint(id + corners[0]),
+		GetPoint(id + corners[1]),
+		GetPoint(id + corners[2]),
+		GetPoint(id + corners[3]),
+		GetPoint(id + corners[4]),
+		GetPoint(id + corners[5]),
+		GetPoint(id + corners[6]),
+		GetPoint(id + corners[7])
+	};
+	node = indexedNode;
+}
+
+/*Takes in a leaf node and calculates its OctIn*/
+OctIn CalculateOctreeInfoLeaf(uint leafLocation, in float4 node[8]) {
+	OctIn info;
+
+	info.largestDotAngle = 3;
+	info.localIntersections = 0;
+	info.globalIntersectionsZYX[0] = 0; info.globalIntersectionsZYX[1] = 0; info.globalIntersectionsZYX[2] = 0;
+
+	//bool leafContainsSurface = false;
+
+	for (int i = 0; i < 12; i++)
+	{
+		bool check = CheckSurface(node[edgeToCorners[i][0]], node[edgeToCorners[i][1]]);
+
+		if (check) {
+
+			/*Can just use childParenEdgeConnections[leafLocation][leafLocation][0,1,2] because parent location doesn't matter with a leaf*/
+			bool edge0 = (i == childParentEdgeConnections[leafLocation][leafLocation][0]);
+			bool edge1 = (i == childParentEdgeConnections[leafLocation][leafLocation][1]);
+			bool edge2 = (i == childParentEdgeConnections[leafLocation][leafLocation][2]);
+
+			if (edge0) {
+				info.globalIntersectionsZYX[0] += 1;
+			}
+			else if (edge1) {
+				info.globalIntersectionsZYX[1] += 1;
+			}
+			else if (edge2) {
+				info.globalIntersectionsZYX[2] += 1;
+			}
+			else {
+				info.localIntersections += 1;
+			}
+
+			info.largestDotAngle = min(info.largestDotAngle, (dot(node[edgeToCorners[i][0]].xyz, node[edgeToCorners[i][1]].xyz)));
+		}
+	}
+
+	//if (info.localIntersections + info.globalIntersectionsZYX[0] + info.globalIntersectionsZYX[1] + info.globalIntersectionsZYX[2] == 0)
+		//info.largestDotAngle = 2;
+
+	return info;
+}
+
+/*Takes in a pair of 8 OctIn's and calculates the parent OctIn of them*/
+OctIn CalculateOctreeInfoPairs(OctIn pairs[8], uint location, uint3 id) {
+
+	OctIn info;
+
+	info.largestDotAngle = 3;
+	info.localIntersections = 0;
+	info.globalIntersectionsZYX[0] = 0; info.globalIntersectionsZYX[1] = 0; info.globalIntersectionsZYX[2] = 0;
+
+	for (uint i = 0; i < 8; i++) {
+
+		bool side0 = childParentEdgeConnections[location][i][0] != -1;
+		bool side1 = childParentEdgeConnections[location][i][1] != -1;
+		bool side2 = childParentEdgeConnections[location][i][2] != -1;
+
+		if (side0) {
+			info.globalIntersectionsZYX[0] += pairs[i].globalIntersectionsZYX[0];
+
+			//if(pairs[i].globalIntersectionsZYX[0] > 0)
+			//	info.largestDotAngle = id.z;
+		}
+		else {
+			info.localIntersections += pairs[i].globalIntersectionsZYX[0];
+		}
+
+		if (side1) {
+			info.globalIntersectionsZYX[1] += pairs[i].globalIntersectionsZYX[1];
+
+			//if(pairs[i].globalIntersectionsZYX[1] > 0)
+			//	info.largestDotAngle = id.z;
+		}
+		else {
+			info.localIntersections += pairs[i].globalIntersectionsZYX[1];
+		}
+
+		if (side2) {
+			info.globalIntersectionsZYX[2] += pairs[i].globalIntersectionsZYX[2];
+
+			//if(pairs[i].globalIntersectionsZYX[2] > 0)
+			//	info.largestDotAngle = id.z;
+		}
+		else {
+			info.localIntersections += pairs[i].globalIntersectionsZYX[2];
+		}
+
+		info.largestDotAngle = min(info.largestDotAngle, pairs[i].largestDotAngle);
+	}
+
+	return info;
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, NUM_THREADS)]
+void GenerateOctreeInfo(uint3 dispatchID : SV_DispatchThreadID, uint3 groupID : SV_GroupThreadID) {
+
+	localMaxDepth = (uint)log2(NUM_THREADS);
+
+	/*
+		the length of each axis of the first dispatchID is (1 << max depth of point data set - 1)
+		After, the length of each axis of dispatchID then becomes (1 << depth where previous dispatch left off - 1)
+	*/
+
+	maxCellsPerAxis = 1 << (maxDepth + 1);
+	maxPointsPerAxis = maxCellsPerAxis + 1;
+
+	uint depth = startDepth;//min(maxDepth, startDepth);
+
+	uint3 globalID = dispatchID;
+
+	uint3 id = dispatchID;
+	uint3 localID = groupID;
+
+	uint3 previousID = dispatchID;
+	previousID.x <<= 1; previousID.y <<= 1; previousID.z <<= 1;
+	uint3 previousLocalID = groupID;
+	previousLocalID.x <<= 1; previousLocalID.y <<= 1; previousLocalID.z <<= 1;
+
+	OctIn pairs[8];
+	if (depth == maxDepth) {
+
+		/*If this is the first dispatch call, calculate octree infos for 8 children nodes of current node*/
+		for (uint i = 0; i < 8; i++) {
+			float4 leaf[8];
+			GetLeafNode(dispatchID * 2 + corners[i], leaf);
+
+			OctIn leafInfo = CalculateOctreeInfoLeaf(i, leaf);
+
+			pairs[i] = leafInfo;
+		}
+
+	}
+	else {
+
+		/*If this is not the first dispatch call, retreive octree infos for 8 children nodes of current node from global memory*/
+		uint nodesPerAxis = 1 << (depth);
+		uint offset = octreeOffset[maxDepth - 1][depth - 1];
+
+		GetGlobalOctreeInfoPairs(offset, id, nodesPerAxis, pairs);
+	}
+
+	uint localDepth = min(depth, localMaxDepth);
+
+	uint iterations = 1;
+
+	for (; depth > 0 && localDepth > 0; depth--) {
+
+		uint offset = octreeOffset[maxDepth - 1][depth - 1]; /*Offset for global memory to store calculated octree info*/
+
+		uint nodesPerAxis = 1 << depth;
+		uint localNodesPerAxis = 1 << localDepth;
+
+		DeviceMemoryBarrierWithGroupSync();
+
+		/*Ensure only relevant threads do memory accesses*/
+		if (globalID.x == dispatchID.x && globalID.y == dispatchID.y && globalID.z == dispatchID.z &&
+			dispatchID.x < startNodesPerAxis && dispatchID.y < startNodesPerAxis && dispatchID.z < startNodesPerAxis) {
+
+			uint3 parentID = id; //id >> (maxDepth - depth); /*Location of parent relative to the current parent node*/
+			parentID.x >>= 1; parentID.y >>= 1; parentID.z >>= 1;
+			//uint3 localParentID = localID >> 1; //localID >> (localMaxDepth - localDepth); /*Location of local child relative to the current parent node*/
+
+			uint location = GetChildLocation(depth == 1 ? id : parentID); /*Get child index relative to parent node*/
+
+			OctIn info = CalculateOctreeInfoPairs(pairs, location, id);
+
+			if (localDepth > 1 && depth > 1)
+			{
+				uint localOffset = octreeOffset[localMaxDepth - 1][localDepth - 1]; /*Offset in for local memory storage*/
+				octreeInfo[localOffset + GetIndex(localID, localNodesPerAxis)] = info; /*Store calculated octree info in local memory*/
+			}
+
+			OctreeInfo[offset + GetIndex(id, nodesPerAxis)] = info; /*Store calculated octree info in global memory*/
+		}
+
+		/*Calculate new parent position in 3-D space*/
+		previousID = id;
+		id.x >>= 1; id.y >>= 1; id.z >>= 1;
+
+		previousLocalID = localID;
+		localID.x >>= 1; localID.y >>= 1; localID.z >>= 1;
+
+
+		DeviceMemoryBarrierWithGroupSync();
+
+		globalID.x >>= iterations; globalID.y >>= iterations; globalID.z >>= iterations;
+		globalID.x <<= iterations; globalID.y <<= iterations; globalID.z <<= iterations;
+
+		/*Ensure only relevant threads do memory accesses*/
+		if (globalID.x == dispatchID.x && globalID.y == dispatchID.y && globalID.z == dispatchID.z && localDepth > 1 && depth > 1)
+		{
+			uint localOffset = octreeOffset[localMaxDepth - 1][localDepth - 1]; /*Offset in local memory to other octree infos calculated by other threads*/
+			GetLocalOctreeInfoPairs(localOffset, previousLocalID, localNodesPerAxis, pairs); /*Get the 8 octree infos for new parent node next iteration*/
+		}
+
+		localDepth--;
+		iterations++;
+	}
+}
+//True means to stop un-subdividing the Octree
+bool EvaluateOctIn(OctIn octIn) {
+	bool surfaceCheck = false;
+	bool angleCheck = false;
+
+	uint totalIntersections = octIn.globalIntersectionsZYX[0] + octIn.globalIntersectionsZYX[1] + octIn.globalIntersectionsZYX[2] + octIn.localIntersections;
+	surfaceCheck = octIn.globalIntersectionsZYX[0] > 1 || octIn.globalIntersectionsZYX[1] > 1 || octIn.globalIntersectionsZYX[2] > 1 || totalIntersections > 5;
+
+	angleCheck = (octIn.largestDotAngle) > angleThreshold;//&& totalIntersections > 0;
+
+	return surfaceCheck || !angleCheck;
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, NUM_THREADS)]
+void GenerateOctree(uint3 dispatchID : SV_DispatchThreadID) {
+
+	//if(dispatchID.x >= startNodesPerAxis || dispatchID.y >= startNodesPerAxis || dispatchID.z >= startNodesPerAxis)
+		//return;
+
+	uint depth = maxDepth;
+
+	uint3 id = dispatchID >> 1;
+	uint3 globalID = dispatchID;
+
+	uint iterations = 1;
+
+	OctIn info;
+
+	bool writtenData = false;
+
+	for (; depth > 1; depth--) {
+
+		uint offset = octreeOffset[maxDepth - 2][depth - 2];
+		uint nodesPerAxis = 1 << depth - 1;
+
+		if (globalID.x == dispatchID.x && globalID.y == dispatchID.y && globalID.z == dispatchID.z)
+		{
+			info = OctreeInfoRead[offset + GetIndex(id, nodesPerAxis)];
+
+			if (writtenData == false && EvaluateOctIn(info))
+			{
+				Octree[dispatchID.xyz] = float4(depth / (float)(maxDepth), 0, 0, 1);
+
+				writtenData = true;
+
+				return;
+			}
+
+		}
+
+		globalID.x >>= iterations; globalID.y >>= iterations; globalID.z >>= iterations;
+		globalID.x <<= iterations; globalID.y <<= iterations; globalID.z <<= iterations;
+
+		id.x >>= 1; id.y >>= 1; id.z >>= 1;
+
+		iterations++;
+	}
+
+	if (writtenData == false && globalID.x == dispatchID.x && globalID.y == dispatchID.y && globalID.z == dispatchID.z)
+		Octree[dispatchID.xyz] = float4(depth / (float)(maxDepth), 0, 0, 1);
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, NUM_THREADS)]
+void MarkTransitionals(uint3 id : SV_DispatchThreadID)
+{
+	//maxCellsPerAxis = 1 << (maxDepth + 1);
+
+	float4 node = OctreeRead[id.xyz];
+
+	uint transitionalNeighbors = 0;
+	uint transitionalNeighborsDepths = 0;
+
+	if (node.w > 0.2) {
+		uint depth = ceil((node.x - 0.00001) * (maxDepth));
+		int stride = 1 << (maxDepth - depth);
+
+		for(uint n = 0; n < 6; n++) {
+			uint3 neighborID = id.xyz + neighbors[n] * stride;
+
+			if(neighborID.x >= startNodesPerAxis || neighborID.y >= startNodesPerAxis || neighborID.z >= startNodesPerAxis)
+				continue;
+
+			float4 neighbor = OctreeRead[neighborID];
+
+			if(neighbor.w < 0.2) {
+				continue;
+            }
+
+			uint neighborDepth = ceil((neighbor.x - 0.00001) * (maxDepth));
+
+			if(neighborDepth <= depth) {
+				continue;
+            }
+
+			//Octree[id.xyz] = float4(node.x, (float)transitionalNeighbors / TRANSI_NEIGHBOR_MAX, (float)transitionalNeighborsDepths / TRANSI_NEIGHBOR_DEPTH_MAX, 0.5);
+
+			transitionalNeighbors |= 1 << n;
+
+			if(n % 2 == 0) {
+				int nextStride = 1 << (maxDepth - neighborDepth);
+				uint3 nextNeighborID = neighborID.xyz - neighbors[n] * nextStride;
+
+				do {
+					neighborID = nextNeighborID;
+
+					neighbor = OctreeRead[neighborID];
+
+					neighborDepth = ceil((neighbor.x - 0.00001) * (maxDepth));
+					int nextStride = 1 << (maxDepth - neighborDepth);
+
+					nextNeighborID = neighborID.xyz - neighbors[n] * nextStride;
+
+                } while(!(nextNeighborID.x == id.x && nextNeighborID.y == id.y && nextNeighborID.z == id.z));
+
+				transitionalNeighborsDepths += neighborDepth << (n / 2) * 4; 
+			}
+	
+			//transitionalNeighborsDepths = neighborDepth;  // << (n) * 5;
+
+			//return;
+        }
+
+		//Octree[id.xyz] = float4(node.x, (float)transitionalNeighbors / TRANSI_NEIGHBOR_MAX, (float)transitionalNeighborsDepths / TRANSI_NEIGHBOR_DEPTH_MAX, 0.5);
+	}
+
+	if(transitionalNeighbors > 0) {
+		Octree[id.xyz] = float4(node.x, (float)transitionalNeighbors / TRANSI_NEIGHBOR_MAX, (float)transitionalNeighborsDepths / TRANSI_NEIGHBOR_DEPTH_MAX, 0.5);
+    }
+}
+
+
+uint GetOctreeAddress(uint3 id) {
+	uint address = 0;
+	for (uint i = 0; i < maxDepth; i++)
+	{
+		uint bit = 1 << (maxDepth - i - 1);
+		address += ((id.y & bit) == bit ? 1 : 0) << i * 3 + 1;
+		address += ((id.x & bit) == bit ? 1 : 0) << i * 3 + 2;
+		address += ((id.z & bit) == bit ? 1 : 0) << i * 3 + 0;
+	}
+	return address;
+} //Address is arranged so first subdivisions of the octree are at the start of the bit
+
+
+[numthreads(NUM_THREADS, NUM_THREADS, NUM_THREADS)]
+void Display(uint3 id : SV_DispatchThreadID)
+{
+	float4 node = Octree[id.xyz];
+
+	if (node.w > 0.9) {
+		int	depth = ceil((node.x - 0.00001) * (maxDepth));
+		int address = GetOctreeAddress(id);
+
+		float size = Size;
+		float3 center = Center;
+		for (int i = 0; i < depth; i++)
+		{
+			center += forward * size * 0.25f * ((address & 1) == 1 ? 1 : -1);
+			center += up * size * 0.25f * ((address & 2) == 2 ? 1 : -1);
+			center += right * size * 0.25f * ((address & 4) == 4 ? 1 : -1);
+
+			size *= 0.5;
+			address >>= 3;
+		}
+
+		Node n;
+		n.center = center;
+		n.size = size;
+		Nodes.Append(n);
+	}
+}
+
