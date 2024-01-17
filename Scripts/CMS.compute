@@ -1,0 +1,818 @@
+﻿/*TODO
+
+-Implement CMS on uniform grid
+-Construct octree by analyzing per cube instead of per point
+	-Maybe store octree depth info in same struct as surface info (maybe only on octree edge points)
+-Run CMS on leaves of octree m
+-Solve transitional cases within own octree
+-Figure out how get info from neighboring octree to solve transitional on edge of current tree
+
+*/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  // Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel GenerateSegments
+#pragma kernel GenerateMesh
+//#pragma enable_d3d11_debug_symbols
+
+#include "Includes/CMS_Tables.compute"
+
+
+#define NUM_THREADS 4
+
+#define TRANSI_NEIGHBOR_MAX 128
+#define TRANSI_NEIGHBOR_DEPTH_MAX 8192 
+
+struct Triangle {
+	float3 p1;
+	float3 p2;
+	float3 p3;
+};
+
+struct Face {
+	int segments;
+};
+
+struct CubePoint {
+	Face faces[6];
+	float3 vertices[12];
+};
+
+RWStructuredBuffer<float4> _Points;
+AppendStructuredBuffer <Triangle> _Triangles;
+RWStructuredBuffer<float3> _Testing;
+RWTexture3D<float4>Octree;
+
+RWStructuredBuffer<CubePoint> _Segments;
+
+float threshold;   //Surface level
+uint pointsPerAxis;  //Number of points per axis of current chunk
+
+float pointSpacing = 1;
+float3 center;
+
+uint maxDepth;
+
+float3 findWorldCornerLocation(int3 id, int cornerNum, int length) {
+	return float3(id.xyz + corners[cornerNum] * length - (float)(pointsPerAxis - 1) / (float)2) * pointSpacing;
+}
+
+float3 findWorldCornerLocation(int3 id) {
+	return float3(id.xyz - (float)(pointsPerAxis - 1) / (float)2) * pointSpacing;
+}
+
+float3 interpolateVert(float4 v1, float4 v2) {
+	float t = abs((threshold - v1.w) / (v2.w - v1.w));
+	float3 dir = (v2.xyz - v1.xyz) * t;
+	return v1.xyz + dir;
+}
+
+float4 getPoint(uint3 index) {
+	return _Points[index.z + index.y * pointsPerAxis + index.x * pointsPerAxis * pointsPerAxis];
+}
+
+float3 findVertex(uint3 id, uint i1, uint i2, int length) {
+
+	float4 p1 = getPoint(id + corners[i1] * length);
+	float4 p2 = getPoint(id + corners[i2] * length);
+
+	float3 w1 = findWorldCornerLocation(id + corners[i1] * length);
+	float3 w2 = findWorldCornerLocation(id + corners[i2] * length);
+
+
+	int to = i2;//sign(p1.w - threshold) > 0 ? i1 : i2;
+	int from = i1;//sign(p2.w - threshold) > 0 ? i2 : i1;
+
+	uint3 dir = corners[to] - corners[from];
+
+	for(int i = 0; i < length; i++) {
+		float4 tempP1 = getPoint(id + corners[from] * length + dir * i);
+		float4 tempP2 = getPoint(id + corners[from] * length + dir * (i + 1));
+
+		int s1 = sign(tempP1.w - threshold);
+		int s2 = sign(tempP2.w - threshold);
+
+		if(s1 != s2 && (s1 != 0 || s2 != 0)) {
+			w1 = findWorldCornerLocation(id + corners[from] * length  + dir * i);
+			w2 = findWorldCornerLocation(id + corners[from] * length  + dir * (i + 1));
+
+			p1 = tempP1;
+			p2 = tempP2;
+
+			break;
+        }
+    }
+
+	return interpolateVert(float4(w1,p1.w), float4(w2,p2.w));
+}
+
+void getVoxel(int3 index, int length, out float4 cube[8], out int simplifiedCube[8]) {
+	float4 voxel[8] = {
+		getPoint(index + corners[0] * length),
+		getPoint(index + corners[1] * length),
+		getPoint(index + corners[2] * length),
+		getPoint(index + corners[3] * length),
+		getPoint(index + corners[4] * length),
+		getPoint(index + corners[5] * length),
+		getPoint(index + corners[6] * length),
+		getPoint(index + corners[7] * length)
+	};
+	int simplify[8] = {
+		sign(voxel[0].w - threshold),
+		sign(voxel[1].w - threshold),
+		sign(voxel[2].w - threshold),
+		sign(voxel[3].w - threshold),
+		sign(voxel[4].w - threshold),
+		sign(voxel[5].w - threshold),
+		sign(voxel[6].w - threshold),
+		sign(voxel[7].w - threshold)
+	};
+
+	cube = voxel;
+	simplifiedCube = simplify;
+}
+
+int getConfig(uint f, int cube[8]) {
+	int config = 0;
+	for (uint c = 0; c < 4; c++) {
+		if (cube[localCornerToCorner[f][c]] < 0)
+			config |= 1 << c;
+	}
+	return config;
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, NUM_THREADS)]
+void GenerateSegments(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= pointsPerAxis - 1 || id.y >= pointsPerAxis - 1 || id.z >= pointsPerAxis - 1)
+		return;
+
+	float4 node = Octree[id.xyz];
+
+	int	octreeDepth = ceil((node.x - 0.00001) * (maxDepth));
+
+	int accessSize = 1 << maxDepth - octreeDepth;
+
+	if (node.w < 0.3) {
+		return;
+	}
+
+	float3 vertices[12];
+	bool vertCheck[12] = { false,false,false,false,false,false,false,false,false,false,false,false };
+
+	float4 cube[8];
+	int simplifiedCube[8];
+
+	getVoxel(id, accessSize, cube, simplifiedCube); //Get the 8 sample points of current cube/voxel
+
+	Face faces[6];
+
+	int configs[6];
+
+	//#pragma region Populating_Strips
+
+	uint f;
+	for (f = 0; f < 6; f++) //Loop through every face of Cube/Node/Voxel
+	{
+		int config = getConfig(f, simplifiedCube);
+
+		configs[f] = config;
+
+		Face face;
+		face.segments = config;
+
+		/*TODO - modify vertex finding to handle non-fully subdivided nodes and prevent vertex duplicates (find a way to create global index based on edge of current cell) */
+		for (uint p = 0; p < 2; p++)
+		{
+			uint index = p * 2;
+
+			if (triangulation[config][index] == -1) break; //No more strips on current face
+
+			int edge1 = triangulation[config][index]; //First local edge of current strip in current config as defined by MS Table
+			int edge2 = triangulation[config][index + 1]; //Second local edge of current strip in current config as defined by MS Table
+
+			uint i1 = localCornerToCorner[f][localEdgeToLocalCorner[edge1][0]]; /*First corner index of first vertex*/
+			uint i2 = localCornerToCorner[f][localEdgeToLocalCorner[edge1][1]]; /*Second corner index of first vertex*/
+
+			  //First vertex
+			float3 v1 = findVertex(id, i1, i2, accessSize);
+
+			uint i3 = localCornerToCorner[f][localEdgeToLocalCorner[edge2][0]];    //First corner index of second vertex
+			uint i4 = localCornerToCorner[f][localEdgeToLocalCorner[edge2][1]];    //Second corner index of second vertex
+
+			 //Second Vertex
+			float3 v2 = findVertex(id, i3, i4, accessSize);
+
+			uint vi1 = localEdgeToEdge[f][edge1]; /*First vertex index [0,12)*/
+			uint vi2 = localEdgeToEdge[f][edge2]; /*Second vertex index [0, 12)*/
+
+			/*Store vertexes in vertices array for access later*/
+
+			if (vertCheck[vi1] == false) {
+				vertices[vi1] = v1;
+				vertCheck[vi1] = true;
+			}
+
+			if (vertCheck[vi2] == false) {
+				vertices[vi2] = v2;
+				vertCheck[vi2] = true;
+			}
+
+			if (p == 0) {
+				face.segments |= edge1 << 4;
+				face.segments |= edge2 << 8;
+			}
+			else {
+				face.segments |= edge1 << 12;
+				face.segments |= edge2 << 16;
+			}
+		}
+
+		faces[f] = face;
+	}
+
+	CubePoint cp;
+	cp.faces = faces;
+	cp.vertices = vertices;
+
+	_Segments[id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)] = cp;
+}
+
+uint3 findNeighborLeaf(uint3 n_ID, uint faceNum, int neighborDepth, uint3 dir, out float4 n_next, out int n_nextDepth) {
+
+	int stepSize = 1 << (maxDepth - neighborDepth);
+
+	uint3 n_nextID = n_ID + dir * stepSize;
+
+	n_next = Octree[n_nextID];
+
+	n_nextDepth = ceil((n_next.x - 0.00001) * (maxDepth));
+
+	uint n_nextStepSize = 1 << (maxDepth - n_nextDepth);
+
+	if(n_next.w < 0.2) {
+		while(n_next.w < 0.2) {
+			n_nextID.x >>= 1; n_nextID.y >>= 1; n_nextID.z >>= 1;
+			n_nextID.x <<= 1; n_nextID.y <<= 1; n_nextID.z <<= 1;
+
+			n_next = Octree[n_nextID];
+		}
+    } else if (n_nextDepth > neighborDepth) {
+		uint dist = 1 << (n_nextDepth - neighborDepth);
+
+		uint i = 0;
+		while(i < dist) {
+				n_nextID -= neighbors[faceNum] * n_nextStepSize;
+
+				n_next = Octree[n_nextID];
+
+				i += n_nextStepSize;
+
+				n_nextDepth = ceil((n_next.x - 0.00001) * (maxDepth));
+
+				n_nextStepSize = 1 << (maxDepth - n_nextDepth);
+        }
+    }
+
+	return n_nextID;
+}
+
+uint resolveTransitional(uint depth, uint faceNum, uint start, float3 startVertex, float3 endVertex, uint size,
+							inout float3 transitionalVertices[32], int segments[4], uint3 id)
+{
+	uint transitionalVerticesSize = size;
+	
+	uint inverseFace = inverseFaces[faceNum]; //Focus face of neighbors that will be accessed
+
+	uint targetEdge = segments[start]; //Start edge of the transitional face
+
+
+	//Get to correct starting position for face and targetEdge
+
+	uint3 startCorner = id.xyz + corners[edgeToCorners[localEdgeToEdge[faceNum][targetEdge]][0]] * ((1 << (maxDepth - depth)) - 1); //Go the first corner of current target edge
+
+	uint3 n_ID = startCorner + neighbors[faceNum]; //Move over one unit in the octree data structure
+
+	float4 neighbor = Octree[n_ID];
+
+	uint safety = 0;
+
+	//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = n_ID;
+
+	//if the node in the octree at that position is not a leaf node, keep checking its parent until a leaf node is found (leaf node found should be exact neighbor of targetEdge)
+	while(neighbor.w < 0.2) {
+		n_ID.x >>= 1; n_ID.y >>= 1; n_ID.z >>= 1;
+		n_ID.x <<= 1; n_ID.y <<= 1; n_ID.z <<= 1;
+
+		neighbor = Octree[n_ID];
+
+		//safety++;
+    }
+
+	//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = n_ID;
+
+
+	//Iterate over the neighbors on that edge until a surface is found
+
+	int3 dir = corners[edgeToCorners[localEdgeToEdge[faceNum][targetEdge]][1]] - corners[edgeToCorners[localEdgeToEdge[faceNum][targetEdge]][0]]; //Calculate the direction to iterate along the current target edge (from corner0 of target edge to corner1 of target edge)
+
+	//Grab data from current neighbor
+	
+	CubePoint cp = _Segments[n_ID.z + n_ID.y * (pointsPerAxis - 1) + n_ID.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)]; 
+
+	Face neighborFace = cp.faces[inverseFace]; 
+
+	uint n_config = neighborFace.segments & 15;
+
+	int n_seg = neighborFace.segments;
+	uint n_segments[4] = {0,0,0,0};
+	n_segments[0] = (n_seg >> 4) & 15;
+	n_segments[1] = (n_seg >> 8) & 15;
+	n_segments[2] = (n_seg >> 12) & 15;
+	n_segments[3] = (n_seg >> 16) & 15;
+
+	int	neighborDepth = ceil((neighbor.x - 0.00001) * (maxDepth)); 
+
+	int stepSize = 1 << (maxDepth - neighborDepth);
+
+	//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = float3(localEdgeToEdge[inverseFace][n_segments[0]], localEdgeToEdge[inverseFace][n_segments[1]], 0);
+	//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = float3(n_segments[1], inverseEdges[faceNum][targetEdge],0);
+	//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = dir;
+
+	//uint _start = 0;
+	
+	 //Iterate over the edge until a node is found with a surface that passes on the same edge as the target edge
+	while(true) {
+
+		if(n_config != 0 && n_config != 15) { //Check for surface and if so, check for matching surface intersections
+
+			if(inverseEdges[faceNum][targetEdge] == n_segments[0]) {
+				start = 0; break;
+			}
+			if(inverseEdges[faceNum][targetEdge] == n_segments[1]) {
+				start = 1; break;
+			}
+
+			if(n_config == 6 || n_config == 9) {
+				if(inverseEdges[faceNum][targetEdge] == n_segments[2]) {
+					start = 2; break;
+				}
+				if(inverseEdges[faceNum][targetEdge] == n_segments[3]) {
+					start = 3; break;
+				}
+			}
+		}
+
+		float4 n_next; int n_nextDepth;
+		uint3 n_nextID = findNeighborLeaf(n_ID, faceNum, neighborDepth, dir, n_next, n_nextDepth); //Move one node length along current direction and find leaf node that is a neighbor to the transitional face
+
+		//stepSize = 1 << (maxDepth - neighborDepth);
+
+		//uint3 n_nextID = n_ID + dir * stepSize;
+
+		//n_next = Octree[n_nextID];
+
+		//n_nextDepth = ceil((n_next.x - 0.00001) * (maxDepth));
+
+		//Grab data from next neighbor
+
+		CubePoint cp_next = _Segments[n_nextID.z + n_nextID.y * (pointsPerAxis - 1) + n_nextID.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)];
+
+		neighborFace = cp_next.faces[inverseFace];
+
+		n_config = (neighborFace.segments & 15);
+
+		n_seg = neighborFace.segments;
+		n_segments[0] = (n_seg >> 4) & 15;
+		n_segments[1] = (n_seg >> 8) & 15;
+		n_segments[2] = (n_seg >> 12) & 15;
+		n_segments[3] = (n_seg >> 16) & 15;
+
+		n_ID = n_nextID;
+		cp = cp_next;
+		neighbor = n_next;
+		neighborDepth = n_nextDepth;
+    }
+
+	//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = n_ID;
+
+	//Follow the components until the vertex added to the transitionalComponent equals that of the endVertex of the original segment
+
+	transitionalVertices[transitionalVerticesSize] = startVertex; //Add the start vertex to the transitional vertices array
+
+	transitionalVerticesSize++;
+
+	//uint n_v = n_segments[0];
+		//if (start == 2 || start == 0) {
+			//n_v = n_segments[start + 1];
+		//}
+		//else {
+			//n_v = n_segments[start - 1];
+		//} //Get index of next vertex in the segment
+
+	//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = float3(start, inverseFace,0);
+
+	//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = startVertex;
+
+	//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = cp.vertices[localEdgeToEdge[inverseFace][n_segments[1]]];
+
+		//transitionalVertices[transitionalVerticesSize] = cp.vertices[localEdgeToEdge[inverseFace][n_v]];
+
+	//transitionalVerticesSize++;
+
+		//transitionalVertices[transitionalVerticesSize] = endVertex;
+
+	//transitionalVerticesSize++;
+
+	do {
+		uint n_v = 1;
+		if (start == 2 || start == 0) {
+			n_v = n_segments[start + 1];
+		}
+		else {
+			n_v = n_segments[start - 1];
+		} //Get index of next vertex in the segment
+
+		transitionalVertices[transitionalVerticesSize] = cp.vertices[localEdgeToEdge[inverseFace][n_v]]; //Add that vertex to transitional vertices array
+
+		transitionalVerticesSize++; //Increase size of current transitional vertices array by 1
+
+		if(length(endVertex.xyz - transitionalVertices[transitionalVerticesSize - 1].xyz) <= 0.0001) {
+			break;
+        }
+
+		dir = nextNeighbor[inverseFace][n_v]; //Get new direction to neighbor that continues the segment
+
+		//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = float3(n_segments[start],n_v,0);
+		//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = dir;
+
+		//break;
+
+		float4 n_next; int n_nextDepth;
+		uint3 n_nextID = findNeighborLeaf(n_ID, faceNum, neighborDepth, dir, n_next, n_nextDepth); //Find next neighbor
+
+		//stepSize = 1 << (maxDepth - neighborDepth);
+
+		//uint3 n_nextID = n_ID + dir * stepSize;
+
+		//n_next = Octree[n_nextID];
+
+		//n_nextDepth = ceil((n_next.x - 0.00001) * (maxDepth));
+
+		//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = n_nextDepth;
+
+		//break;
+
+		//Get data on next neighbor
+
+		CubePoint cp_next = _Segments[n_nextID.z + n_nextID.y * (pointsPerAxis - 1) + n_nextID.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)];
+
+		neighborFace = cp_next.faces[inverseFace];
+
+		n_config = neighborFace.segments & 15;
+
+		n_seg = neighborFace.segments;
+		n_segments[0] = (n_seg >> 4) & 15;
+		n_segments[1] = (n_seg >> 8) & 15;
+		n_segments[2] = (n_seg >> 12) & 15;
+		n_segments[3] = (n_seg >> 16) & 15;
+
+		n_ID = n_nextID;
+		cp = cp_next;
+		neighbor = n_next;
+		neighborDepth = n_nextDepth;
+
+		//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = cp.vertices[localEdgeToEdge[inverseFace][n_segments[1]]];//float3(inverseEdge[n_v], n_segments[0], n_segments[1]);
+
+		//break;
+
+		start = 1; //Check for matching surface intersections
+
+		if(inverseEdge[n_v] == n_segments[0]) {
+			start = 0;
+        }
+		if(inverseEdge[n_v] == n_segments[1]) {
+			start = 1;
+        }
+
+		if(n_config == 6 || n_config == 9) {
+			if(inverseEdge[n_v] == n_segments[2]) {
+				start = 2;
+			}
+			if(inverseEdge[n_v] == n_segments[3]) {
+				start = 3;
+			}
+		}
+
+		//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + faceNum] = dir;//float3(inverseEdge[n_v], n_segments[0], n_segments[1]);
+
+		//break;
+
+		
+
+    } while(true); //If the endvertex of the orginal unsubdivided face is the same as the vertex just added, transitional face is resolved
+
+	//transitionalVerticesSize++;
+
+	//transitionalVertices[transitionalVerticesSize] = endVertex;
+
+	//transitionalVerticesSize++;
+	
+	return transitionalVerticesSize;
+}
+
+/*Creates an array of vertex indices called component and returns the length of how many indices are in the array */
+uint traceComponent(uint depth, uint startFace, int configs[6], Face faces[6], uint visitedIn[6], out uint visitedOut[6], inout int component[32], uint3 id, float3 vertices[12],
+					inout float3 transitionalVertices[32], bool transitionals[6], uint transitionalsDepths[6])
+{
+	Face face = faces[startFace];
+
+	uint seg = face.segments;
+
+	int segments[4] = {0,0,0,0};
+	segments[0] = (seg >> 4) & 15;
+	segments[1] = (seg >> 8) & 15;
+	segments[2] = (seg >> 12) & 15;
+	segments[3] = (seg >> 16) & 15;
+	
+
+	uint start = 0;
+
+	int transitionalVerticesSize = 0;
+
+	uint f = startFace;
+
+
+	uint index = 2; //How many elements in component are used
+
+	if ((configs[startFace] == 6 || configs[startFace] == 9) && visitedIn[startFace] > 1)
+		start = (visitedIn[startFace] - 2) * 2;
+
+	//visited = 3 means already looked at first strip so start on second strip
+
+	_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + startFace] = float3(transitionals[startFace], seg & 15, 1);
+
+	/* First two elements of the component will be the strip of the starting face */
+	component[0] = localEdgeToEdge[startFace][segments[start]];   //(min12int)face.strips[start].verts.x;
+
+	if(transitionals[startFace] == 1) {
+		component[1] = -(int)(transitionalVerticesSize + 1);
+		transitionalVerticesSize = resolveTransitional(depth, f, start, vertices[localEdgeToEdge[f][segments[start]]],
+					vertices[localEdgeToEdge[f][segments[start + 1]]], transitionalVerticesSize,transitionalVertices, segments, id);
+		component[2] = -(int)(transitionalVerticesSize + 1);
+
+		index = 4;
+    }
+
+	component[index - 1] = localEdgeToEdge[startFace][segments[start + 1]];
+
+
+	/*Determine whether the starting face is resolved or is ambiguous*/
+	uint visited[6] = visitedIn;
+
+	if(visited[startFace] == 0)
+		visited[startFace] = 1;
+
+	
+
+	int v = segments[start + 1];
+
+
+	while (component[0] != component[index - 1]) {
+		int2 next = nextPosition[f][v]; /*Find face that shares edge with strip of the current face*/
+
+		f = next.x;
+		face = faces[f];
+
+		seg = face.segments;
+
+		segments[0] = (seg >> 4) & 15;
+		segments[1] = (seg >> 8) & 15;
+		segments[2] = (seg >> 12) & 15;
+		segments[3] = (seg >> 16) & 15;
+	
+
+		start = 0;
+
+		uint i;
+		for (i = 0; i < 4; i++) {
+			if (next.y == triangulation[configs[f]][i]) {
+				start = i;
+			}
+		}
+
+		/*Adjust start to account for ambiguouity*/
+
+
+		/*Add the end of this face's strip to the component object*/
+	
+
+		if (start == 2 || start == 0) {
+			v = segments[start + 1];
+		}
+		else {
+			v = segments[start - 1];
+		}
+
+		_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + f] = float3(transitionals[f], 0, 1);
+		/*if(transitionals[f] == 1) {
+			component[index] = -(int)(transitionalVerticesSize + 1);
+			transitionalVerticesSize = resolveTransitional(depth, f, start, vertices[localEdgeToEdge[f][segments[start]]],
+					vertices[localEdgeToEdge[f][v]], transitionalVerticesSize,transitionalVertices, segments, id);
+			component[index + 1] = -(int)(transitionalVerticesSize + 1);
+
+			index += 2;
+
+			//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + f] = float3(transitionalVerticesSize, 0, 0);
+        }*/
+
+		component[index] = localEdgeToEdge[f][v];
+
+		if (configs[f] == 6 || configs[f] == 9) {
+			if (start == 0 && visited[f] == 0) {   //if start == 0 and visited[startFace] != 2, then second strip has not be visited previously
+				visited[f] = 3;
+			}
+			else if (start == 2 && visited[f] == 0) {   //if start == 2 and visited[startFace] != 3, then first strip has not be visited previously
+				visited[f] = 2;
+			}
+			else {
+				visited[f] = 1;
+			}
+		}
+		else {
+			visited[f] = 1;
+		}
+
+		index++;
+
+		   //Safety Check 
+		if (index >= 32) {
+			break;
+		}
+
+		//_Testing[(id.z + id.y * 3 + id.x * 3 * 3) * 6 + f] = visited[f];
+
+	}  //Check to see if starting vertex and vertex just added are the same
+
+	visitedOut = visited;
+
+	return index;
+}
+
+/*Creates triangles and then appends them to the buffer creating the mesh*/
+void generateComponent(uint size, int component[32], float3 vertices[12], inout float3 transitionalVertices[32], uint f, uint3 id) {
+
+	if (size - 1 > 4) {
+		float3 center = 0;
+		uint actualSize = 0;
+
+		for (uint o = 0; o < size - 1; o++) {
+
+			if(component[o] >= 0)  {
+				center += vertices[component[o]];
+				actualSize++;
+			}
+		}
+
+		center /= (actualSize);
+
+		for (o = 0; o < size - 1; o++) {
+
+			if(component[o + 1] < 0) {
+				o+=1;
+				uint start = abs(component[o]) - 1;
+				uint end = abs(component[o + 1]) - 1;
+
+				//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + f] = float3(component[o],component[o + 1],0);
+
+				for(uint i = start; i < end - 1; i++) {
+					Triangle tri;
+					tri.p1 = transitionalVertices[i];
+					tri.p2 = transitionalVertices[i + 1];
+					tri.p3 = center;
+
+					_Triangles.Append(tri);
+                }
+
+				 o+=1;
+			} else {
+				Triangle tri;
+				tri.p1 = vertices[component[o]];
+				tri.p2 = vertices[component[o + 1]];
+				tri.p3 = center;
+
+				_Triangles.Append(tri);
+			}
+		}
+	}
+	else {
+		uint o = 0;
+		for (o = 0; o < size - 2; o += 2) {
+
+			Triangle tri;
+			tri.p1 = vertices[component[o]];
+			tri.p2 = vertices[component[o + 1]];
+			tri.p3 = vertices[component[o + 2]];
+
+			_Triangles.Append(tri);
+		}
+	}
+}
+
+
+
+
+[numthreads(NUM_THREADS, NUM_THREADS, NUM_THREADS)]
+void GenerateMesh(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= pointsPerAxis - 1 || id.y >= pointsPerAxis - 1 || id.z >= pointsPerAxis - 1)
+		return;
+
+
+	float4 node = Octree[id.xyz];
+
+	int	octreeDepth = ceil((node.x - 0.00001) * (maxDepth));
+
+	int accessSize = 1 << maxDepth - octreeDepth;
+
+	int transitionalsNeighbors = ceil((node.y - 0.0001) * TRANSI_NEIGHBOR_MAX);
+	int transitionalsNeighborsDepths = ceil((node.z - 0.0001) * TRANSI_NEIGHBOR_DEPTH_MAX);
+
+	if (node.w < 0.3) {
+		return;
+	}
+
+
+	int configs[6];
+
+	CubePoint cp = _Segments[id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)];
+
+	Face faces[6] = cp.faces;
+	float3 vertices[12] = cp.vertices;
+
+	bool transitionals[6];
+	uint transitionalsDepths[6];
+	
+	uint f;
+	for (f = 0; f < 6; f++)
+	{
+		configs[f] = faces[f].segments & 15;
+		transitionals[f] = transitionalsNeighbors & (1 << f);
+
+		if(f % 2 == 0) {
+			transitionalsDepths[f] = transitionalsNeighborsDepths & (15 << (f / 2) * 4);
+		} else {
+			transitionalsDepths[f] = octreeDepth;
+        }
+	}
+
+
+	f = 0;
+	uint visited[6] = { 0,0,0,0,0,0 }; /*Array of faces that have been visited*/
+	while (f < 6)
+	{
+		//int neighborDepth = 0;
+
+		//f(f % 2 == 0) {
+		//	neighborDepth = transitionalsNeighborsDepths & 15;     //(transitionalNeighborsDepths & 1) + (transitionalNeighborsDepths & 2) + (transitionalNeighborsDepths & 4) + (transitionalNeighborsDepths & 8);
+		//	transitionalsNeighborsDepths >>= 4;
+		//}
+
+		//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + f] = float3(transitionals[f], 0, octreeDepth);
+
+		if (visited[f] != 1) { //Check if face has been visited and resolved: 0 = not visited, 1 = visited & resolved, 3 = visited first strip & not resolved, 2 = visited second strip & not resolved
+
+			int config = configs[f];
+
+			if (config == 0 || config == 15) { /*Check make sure surface passes through face*/
+				visited[f] = 1;
+			}
+			else {
+
+				int component[32] = { 12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12,12};  //Pre built array that gets populated later, going to contain indices of edges to connect
+				float3 transitionalVertices[32] = {float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0),float3(0,0,0)};
+
+				uint size = traceComponent(octreeDepth, f, configs, faces, visited, visited, component, id, vertices, transitionalVertices, transitionals, transitionalsDepths);
+
+				//_Testing[(id.z + id.y * (pointsPerAxis - 1) + id.x * (pointsPerAxis - 1) * (pointsPerAxis - 1)) * 6 + f] = size;
+
+				generateComponent(size, component, vertices, transitionalVertices, f, id);
+			}
+		}
+
+		f++;
+	}
+}
+

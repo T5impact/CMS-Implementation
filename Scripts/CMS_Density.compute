@@ -1,0 +1,69 @@
+﻿#pragma kernel Smooth
+
+struct Point {
+	float3 pos;
+	uint matIndex;
+};
+
+RWStructuredBuffer<float4> _Chunk;
+
+uint pointsPerAxis = 2;
+
+float surfaceLevel = 0;
+float smoothing = .01;
+
+float3 center;
+float radius;
+float pointSpacing = 1;
+float worldScale = 1;
+
+int octaves;
+float scale;
+float3 offset;
+float lacunarity;
+float persistence;
+
+float epsilon = 0.001;
+
+#include "Assets/Scripts/Computes/Includes/Noise.compute"
+
+[numthreads(4,4,4)]
+void Smooth(uint3 id : SV_DispatchThreadID) 
+{
+	if (id.x >= pointsPerAxis) return;
+	if (id.y >= pointsPerAxis) return;
+	if (id.z >= pointsPerAxis) return;
+
+	float3 worldPoint = center + ((float3)id.zyx - (float)(pointsPerAxis - 1) / 2) * pointSpacing;
+	//float3 samplePoint = ((float3)id - (float)(pointsPerAxis - 1) / 2) * pointSpacing;
+
+	float size = 1;
+	float contribution = 1;
+
+	float4 noise = 0;//length(worldPoint - center) - radius;
+
+	for (int i = 0; i < octaves; i++) {
+		noise += (snoise_grad((worldPoint + offset + epsilon) / scale * size) * contribution / ((float)i + 1)) * worldScale;
+
+		contribution *= persistence;
+		size *= lacunarity;
+	}
+
+	//noise.w = center.y + (worldPoint.y + noise.w);
+
+	noise.xyz = normalize(noise.xyz);
+
+	//float dir = dot(noise.xyz, float3(0,1,0));
+
+	//float change = max(0,smoothing - abs(surfaceLevel - noise.w));
+
+	//noise.w += change * dir;
+
+	uint index = id.z + id.y * pointsPerAxis + id.x * pointsPerAxis * pointsPerAxis;
+
+	/*Point p;
+	p.info = noise;
+	p.matIndex = 0;*/
+
+	_Chunk[index] = float4(noise.xyz, noise.w);
+}
