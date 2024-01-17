@@ -1,5 +1,5 @@
-# CMS-Implementation
-A CMS mesh generator implementation in parallel on the GPU
+# CMS-Octree-Implementation
+A CMS mesh generator implementation in parallel on the GPU with integration to an Octree allowing varying levels-of-detail (LODs)
 
 (Still in development)
 
