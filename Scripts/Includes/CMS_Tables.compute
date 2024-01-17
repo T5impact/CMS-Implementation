@@ -1,0 +1,196 @@
+﻿/*
+LocalEdges = edge indices of one face [0,4)
+Edges = edge indices of one node/cube [0,12)
+
+Point = start or end of an edge [0,2)
+
+LocalCorner = corner indices of one face [0,4)
+Corners = corner indices of one node/cube [0,8)
+*/
+
+
+static const uint3 corners[8] = {
+	uint3(0,0,0),
+	uint3(0,0,1),
+	uint3(0,1,0),
+	uint3(0,1,1),
+	uint3(1,0,0),
+	uint3(1,0,1),
+	uint3(1,1,0),
+	uint3(1,1,1)
+};
+
+static const uint localEdgeToLocalCorner[4][2] = { /*Give local edge number and point index, receive local corner index*/
+	{0,2},
+	{3,1},
+	{1,0},
+	{2,3}
+};
+
+static const uint localEdgeToEdge[6][4] = { /*Give face and local edge index, recieve edge index*/
+	{0,1,2,3},
+	{4,5,6,7},
+	{1,4,8,9},
+	{0,5,11,10},
+	{3,7,9,11},
+	{2,6,10,8}
+};
+
+static const uint localCornerToCorner[6][4] = { /*Give face index and local corner index, receive corner index*/
+	{6,4,2,0},
+	{5,7,1,3},
+	{4,5,0,1},
+	{2,3,6,7},
+	{0,1,2,3},
+	{6,7,4,5}
+};
+
+/* Clockwise */
+static const uint edgeToCorners[12][2] = {
+	{6,2},
+	{4,0},
+	{6,4},
+	{2,0},
+	{5,1},
+	{7,3},
+	{5,7},
+	{1,3},
+	{4,5},
+	{0,1},
+	{6,7},
+	{2,3}
+};
+
+static const int triangulation[16][5] = {
+	{-1,-1,-1,-1,-1},
+	{0,2,-1,-1,-1},
+	{2,1,-1,-1,-1},
+	{0,1,-1,-1,-1},
+	{3,0,-1,-1,-1},
+	{3,2,-1,-1,-1},
+	{3,1,2,0,-1},
+	//{3,0,2,1,-1},
+	{3,1,-1,-1,-1},
+	{1,3,-1,-1,-1},
+	//{1,3,0,2,-1},
+	{0,3,1,2,-1},
+	{2,3,-1,-1,-1},
+	{0,3,-1,-1,-1},
+	{1,0,-1,-1,-1},
+	{1,2,-1,-1,-1},
+	{2,0,-1,-1,-1},
+	{-1,-1,-1,-1,-1}
+};
+
+static const uint2 nextPosition[6][4] = {
+	{ uint2(3,0), uint2(2,0), uint2(5,0), uint2(4,0) },
+	{ uint2(2,1), uint2(3,1), uint2(5,1), uint2(4,1) },
+	{ uint2(0,1), uint2(1,0), uint2(5,3), uint2(4,2) },
+	{ uint2(0,0), uint2(1,1), uint2(4,3), uint2(5,2) },
+	{ uint2(0,3), uint2(1,3), uint2(2,3), uint2(3,2) },
+	{ uint2(0,2), uint2(1,2), uint2(3,3), uint2(2,2) }
+};
+
+
+
+static const uint inverseFaces[6] = {
+	1,0,3,2,5,4
+};
+
+static const uint inverseEdge[4] = {
+	1,0,3,2
+};
+
+static const uint inverseEdges[6][4] = {
+	{ 1, 0, 2, 3 },
+	{ 1, 0, 2, 3 },
+	{ 0, 1, 3, 2 },
+	{ 0, 1, 3, 2 },
+	{ 0, 1, 3, 2 },
+	{ 0, 1, 3, 2 }
+};
+
+//static const uint frontInvNode[8] = {
+//	1,0,3,2,5,4,7,6
+//};
+//
+//static const uint rightInvNode[8] = {
+//	2,3,0,1,6,7,4,5
+//};
+//
+//static const uint upInvNode[8] = {
+//	4,5,6,7,0,1,2,3
+//};
+
+
+/*Given a corner of a node, shows the three edges connected to that corner*/
+static const int cornerEdgeConnections[8][3] = {
+	{1,2,8},
+	{1,3,9},
+	{0,2,10},
+	{0,3,11},
+	{4,6,8},
+	{4,7,9},
+	{5,6,10},
+	{5,7,11}
+};
+
+/*Given a corner of a node, shows the three other corners connected by the three edges connected to the original corner*/
+static const int cornerEdgeCornerConnections[8][3] = {
+	{1,2,4},
+	{5,3,0},
+	{3,0,6},
+	{2,1,7},
+	{5,6,0},
+	{4,7,1},
+	{7,4,2},
+	{6,5,3}
+};
+
+/*[parent location][child location][edge number]*/
+static const int childParentEdgeConnections[8][8][3] = {
+	{ {1,3,9},{1,-1,-1},{-1,2,-1},{-1,-1,-1},{-1,-1,8},{-1,-1,-1},{-1,-1,-1},{-1,-1,-1} },
+	{ {9,-1,-1},{9,7,4},{-1,-1,-1},{-1,7,-1},{-1,-1,-1},{-1,-1,4},{-1,-1,-1},{-1,-1,-1} },
+	{ {-1,3,-1},{-1,-1,-1},{11,3,0},{11,-1,-1},{-1,-1,-1},{-1,-1,-1},{-1,-1,0},{-1,-1,-1} },
+	{ {-1,-1,-1},{-1,7,-1},{11,-1,-1},{11,7,5},{-1,-1,-1},{-1,-1,-1},{-1,-1,-1},{-1,-1,5} },
+	{ {-1,-1,1},{-1,-1,-1},{-1,-1,-1},{-1,-1,-1},{8,2,1},{8,-1,-1},{-1,2,-1},{-1,-1,-1} },
+	{ {-1,-1,-1},{-1,-1,4},{-1,-1,-1},{-1,-1,-1},{8,-1,-1},{8,6,4},{-1,-1,-1},{-1,6,-1} },
+	{ {-1,-1,-1},{-1,-1,-1},{-1,-1,0},{-1,-1,-1},{-1,2,-1},{-1,-1,-1},{10,2,0},{10,-1,-1} },
+	{ {-1,-1,-1},{-1,-1,-1},{-1,-1,-1},{-1,-1,5},{-1,-1,-1},{-1,6,-1},{10,-1,-1},{10,6,5} }
+};
+
+
+/*Offset values for a linear octree [maxDetph - 1][currentDepth - 1]*/
+static const uint octreeOffset[10][10] = {
+	{0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, /*max depth = 1*/
+	{64, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, /*max depth = 2*/
+	{576, 512, 0, 0, 0, 0, 0, 0, 0, 0}, /*max depth = 3*/
+	{4672, 4608, 4096, 0, 0, 0, 0, 0, 0, 0}, /*max depth = 4*/
+	{37440, 37376, 36864, 32768, 0, 0, 0, 0, 0, 0}, /*max depth = 5*/
+	{299584, 299520, 299008, 294912, 262144, 0, 0, 0, 0, 0}, /*max depth = 6*/
+	{2396736, 2396672, 2396160, 2392064, 2359296, 2097152, 0, 0, 0, 0}, /*max depth = 7*/
+	{19173952, 19173888, 19173376, 19169280, 19136512, 18874368, 16777216, 0, 0, 0}, /*max depth = 8*/
+	{153391680, 153391616, 153391104, 153387008, 153354240, 153092096, 150994944, 134217728, 0, 0}, /*max depth = 9*/
+	{1227133504, 1227133440, 1227132928, 1227128832, 1227096064, 1226833920, 1224736768, 1207959552, 1073741824, 0} /*max depth = 10*/
+};
+
+
+static const int3 neighbors[6] = {
+	int3(0,0,-1),
+	int3(0,0,1),
+	int3(0,-1,0),
+	int3(0,1,0),
+	int3(-1,0,0),
+	int3(1,0,0)
+};
+
+
+/*[target face][target edge]*/
+static const int3 nextNeighbor[6][4] = {
+	{ int3(0,1,0), int3(0,-1,0), int3(1,0,0), int3(-1,0,0) },
+	{ int3(0,-1,0), int3(0,1,0), int3(1,0,0), int3(-1,0,0) },
+	{ int3(0,0,-1), int3(0,0,1), int3(1,0,0), int3(-1,0,0) },
+	{ int3(0,0,-1), int3(0,0,1), int3(-1,0,0), int3(1,0,0) },
+	{ int3(0,0,-1), int3(0,0,1), int3(0,-1,0), int3(0,1,0) },
+	{ int3(0,0,-1), int3(0,0,1), int3(0,1,0), int3(0,-1,0) },
+};
